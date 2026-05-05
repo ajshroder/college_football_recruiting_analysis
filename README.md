@@ -6,7 +6,7 @@
 ### Andrew Shroder, Ben Burns, Andrew Wolfson, Cole LaCamera
 
 ---
-Tableau Link: 
+Tableau Link: https://public.tableau.com/app/profile/andrew.wolfson/viz/CollegeFootballRecruitingAnalysis/Story1?publish=yes
 Youtube Link: youtube.com/watch?v=P0VLp4zy7TU&feature=youtu.be
 ---
 
