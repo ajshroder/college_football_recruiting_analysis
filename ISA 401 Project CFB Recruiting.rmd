@@ -1,0 +1,542 @@
+---
+title: 'ISA 401 Project: CFB Recruiting'
+author: "Andrew Wolfson"
+date: "2026-04-24"
+output: html_document
+---
+
+```{r}
+# 0. SETUP
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(tidyr)
+library(rvest)
+library(stringr)
+library(purrr)
+
+api_key <- Sys.getenv("CFBD_API_KEY")
+```
+
+
+```{r}
+# 1. API FUNCTION FOR GAME DATA
+
+get_games <- function(year) {
+  url <- paste0("https://api.collegefootballdata.com/games?year=", year)
+  
+  res <- GET(
+    url,
+    add_headers(Authorization = paste("Bearer", api_key))
+  )
+  
+  message("Year: ", year, " | Status: ", status_code(res))
+  
+  Sys.sleep(0.5)
+  
+  fromJSON(content(res, "text", encoding = "UTF-8"), flatten = TRUE)
+}
+```
+
+
+```{r}
+# acquire/cache
+dir.create("data", showWarnings = FALSE)
+# Create a local data folder and cache raw API results.
+# This avoids repeated API calls and makes the project reproducible if the API changes or rate limits. 
+
+
+if (!file.exists("data/games_raw.rds")) {
+  years <- 2010:2025
+  games_raw <- map_dfr(years, get_games)
+  saveRDS(games_raw, "data/games_raw.rds")
+} else {
+  games_raw <- readRDS("data/games_raw.rds")
+}
+
+# check column names
+names(games_raw)
+```
+
+```{r}
+# 3. CLEAN GAME DATA
+
+# Keep only completed games involving at least one FBS team.
+# removes incomplete games and non-relevant classifications before building team records.
+games_clean <- games_raw %>%
+  filter(
+    completed == TRUE,
+    homeClassification == "fbs" | awayClassification == "fbs"
+  ) %>%
+  select(
+    season,
+    week,
+    seasonType,
+    homeTeam,
+    awayTeam,
+    homePoints,
+    awayPoints,
+    homeClassification,
+    awayClassification,
+    notes
+  )
+```
+
+```{r}
+# 4. BUILD TEAM-LEVEL RECORDS
+
+home_df <- games_clean %>%
+  transmute(
+    year = season,
+    team = homeTeam,
+    opponent = awayTeam,
+    points_for = homePoints,
+    points_against = awayPoints,
+    point_diff = homePoints - awayPoints,
+    win = ifelse(homePoints > awayPoints, 1, 0)
+  )
+
+away_df <- games_clean %>%
+  transmute(
+    year = season,
+    team = awayTeam,
+    opponent = homeTeam,
+    points_for = awayPoints,
+    points_against = homePoints,
+    point_diff = awayPoints - homePoints,
+    win = ifelse(awayPoints > homePoints, 1, 0)
+  )
+
+games_long <- bind_rows(home_df, away_df)
+
+records_clean <- games_long %>%
+  group_by(year, team) %>%
+  summarise(
+    games = n(),
+    wins = sum(win, na.rm = TRUE),
+    losses = games - wins,
+    win_pct = round(wins / games, 3),
+    points_for_avg = round(mean(points_for, na.rm = TRUE), 1),
+    points_against_avg = round(mean(points_against, na.rm = TRUE), 1),
+    avg_pd = round(mean(point_diff, na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# 5. CLEAN TEAM NAME FUNCTION
+
+# Standardize team names across sources before joining.
+# handles inconsistent formatting
+clean_team <- function(x) {
+  x %>%
+    str_to_upper() %>%
+    str_replace_all("&", "AND") %>%
+    str_replace_all("[^A-Z ]", "") %>%
+    str_squish()
+}
+
+records_clean <- records_clean %>%
+  mutate(team_clean = clean_team(team))
+```
+
+```{r}
+# 6. SCRAPE / CACHE 247 RECRUITING DATA
+
+
+# Use tryCatch so the scraping process does not fail completely if a page is unavailable.
+get_247 <- function(year) {
+  url <- paste0("https://247sports.com/season/", year, "-football/teamrankings/")
+  
+  message("Scraping 247 recruiting year: ", year)
+  # If a page cannot be read, return an empty tibble for that year.
+  page <- tryCatch(
+    read_html(url),
+    error = function(e) NULL
+  )
+  
+  if (is.null(page)) {
+    return(tibble())
+  }
+  
+  Sys.sleep(1)
+  
+  rows <- page %>% html_elements(".wrapper")
+  
+  map_df(rows, function(x) {
+    star_nodes <- x %>%
+      html_element(".star-commits-list") %>%
+      html_elements("li")
+    
+    stars_df <- map_df(star_nodes, function(node) {
+      tibble(
+        label = node %>% html_element("h2") %>% html_text(trim = TRUE),
+        value = node %>% html_element("div") %>% html_text(trim = TRUE) %>% as.numeric()
+      )
+    })
+    
+    five_star <- stars_df %>% filter(str_detect(label, "5")) %>% pull(value)
+    four_star <- stars_df %>% filter(str_detect(label, "4")) %>% pull(value)
+    three_star <- stars_df %>% filter(str_detect(label, "3")) %>% pull(value)
+    
+    
+    # Some teams may not have every star-category value listed.
+    tibble(
+      year = year,
+      rec_rank = x %>% html_element(".primary") %>% html_text(trim = TRUE) %>% as.numeric(),
+      team = x %>% html_element(".team") %>% html_text(trim = TRUE),
+      five_star = ifelse(length(five_star) == 0, NA, five_star),
+      four_star = ifelse(length(four_star) == 0, NA, four_star),
+      three_star = ifelse(length(three_star) == 0, NA, three_star),
+      rec_avg = x %>% html_element(".avg") %>% html_text(trim = TRUE) %>% as.numeric(),
+      rec_points = x %>% html_element(".number") %>% html_text(trim = TRUE) %>% as.numeric()
+    )
+  })
+}
+# Missing star counts are stored as NA and later handled when calculating total commits.
+
+
+if (!file.exists("data/recruiting_raw.rds")) {
+  recruiting_raw <- map_dfr(2010:2025, get_247)
+  saveRDS(recruiting_raw, "data/recruiting_raw.rds")
+} else {
+  recruiting_raw <- readRDS("data/recruiting_raw.rds")
+}
+# Clean recruiting data and calculate total commits.
+recruiting_clean <- recruiting_raw %>%
+  mutate( # rowSums prevents missing star categories from breaking the commit total.
+    team_clean = clean_team(team),
+    commits = rowSums(across(c(five_star, four_star, three_star)), na.rm = TRUE)
+  ) %>%
+  select(
+    year,
+    team_clean,
+    rec_rank,
+    five_star,
+    four_star,
+    three_star,
+    commits,
+    rec_avg,
+    rec_points
+  )
+```
+
+```{r}
+# 7. SCRAPE / CACHE AP POLL DATA
+
+poll_map <- tribble(
+  ~year, ~final_id, ~n_polls,
+  2010, 1021, 16,
+  2011, 1037, 16,
+  2012, 1053, 16,
+  2013, 1069, 16,
+  2014, 1085, 16,
+  2015, 1101, 16,
+  2016, 1117, 16,
+  2017, 1133, 16,
+  2018, 1149, 16,
+  2019, 1165, 16,
+  2020, 1181, 16,
+  2021, 1197, 16,
+  2022, 1217, 16,
+  2023, 1233, 16,
+  2024, 1250, 17,
+  2025, 1267, 17
+)
+
+# Use tryCatch to handle unavailable AP poll pages without stopping the full scrape.
+get_ap_poll <- function(appollid, year, poll_num) {
+  url <- paste0("https://www.collegepollarchive.com/football/ap/seasons.cfm?appollid=", appollid)
+  # Invalid or missing pages return an empty tibble.
+  page <- tryCatch(
+    read_html(url),
+    error = function(e) NULL
+  )
+  
+  if (is.null(page)) {
+    return(tibble())
+  }
+  
+  Sys.sleep(0.5)
+  
+  poll_label <- page %>%
+    html_element("h2") %>%
+    html_text(trim = TRUE)
+  
+  rows <- page %>% html_elements("table tbody tr")
+  
+  map_df(rows, function(x) {
+    rank_val <- x %>%
+      html_element("td.text-end strong") %>%
+      html_text(trim = TRUE) %>%
+      suppressWarnings(as.numeric(.))
+    
+    team_val <- x %>%
+      html_element("td a") %>%
+      html_text(trim = TRUE)
+    
+    if (!is.na(rank_val) && !is.na(team_val) && rank_val >= 1 && rank_val <= 25) {
+      tibble(
+        rank = rank_val,
+        team = team_val,
+        year = year,
+        poll_num = poll_num,
+        appollid = appollid,
+        poll_label = poll_label
+      )
+    } else {
+      tibble()
+    }
+  })
+}
+
+if (!file.exists("data/ap_raw.rds")) {
+  ap_raw <- map_df(1:nrow(poll_map), function(i) {
+    yr <- poll_map$year[i]
+    final_id <- poll_map$final_id[i]
+    n_polls <- poll_map$n_polls[i]
+    
+    message("Scraping AP polls for year: ", yr)
+    
+    map_df(0:(n_polls - 1), function(w) {
+      get_ap_poll(
+        appollid = final_id - (n_polls - 1 - w),
+        year = yr,
+        poll_num = w + 1
+      )
+    })
+  })
+  
+  saveRDS(ap_raw, "data/ap_raw.rds")
+} else {
+  ap_raw <- readRDS("data/ap_raw.rds")
+}
+
+ap_clean <- ap_raw %>%
+  mutate(team_clean = clean_team(team))
+```
+```{r}
+ap_clean <- ap_raw %>%
+  mutate(
+    team_clean = clean_team(team),
+    rank = as.numeric(rank),
+    poll_num = as.numeric(poll_num),
+    year = as.numeric(year)
+  )
+# Convert ranking, poll number, and year fields to numeric.
+# This avoids issues where scraped values are read as text instead of numbers.
+```
+
+
+```{r}
+# 8. BUILD AP POLL FEATURES
+
+ap_features <- ap_clean %>%
+  group_by(team_clean, year) %>%
+  summarise(
+    times_ranked = n(),
+    avg_rank = round(mean(rank, na.rm = TRUE), 1),
+    best_rank = min(rank, na.rm = TRUE),
+    final_rank = rank[poll_num == max(poll_num)][1],
+    preseason_rank = rank[poll_num == 1][1],
+    .groups = "drop"
+  ) %>%
+  mutate(
+    final_rank = replace_na(as.numeric(final_rank), 26),
+    preseason_rank = replace_na(as.numeric(preseason_rank), 26)
+  )
+```
+
+```{r}
+# 9. MERGE GAME RECORDS + RECRUITING + AP POLL FEATURES
+
+
+# Merge game performance, recruiting, and AP poll features using cleaned team names and year.
+
+final_df <- records_clean %>%
+  left_join(recruiting_clean, by = c("team_clean", "year")) %>%
+  left_join(ap_features, by = c("team_clean", "year"))
+
+# Left joins keep all team-year game records even if recruiting or ranking data is missing.
+```
+
+```{r}
+# 10. BUILD RECRUITING LAG FEATURES
+
+final_df <- final_df %>%
+  arrange(team_clean, year) %>%
+  group_by(team_clean) %>%
+  mutate(
+    rec_rank_lag1 = lag(rec_rank, 1),
+    rec_rank_lag2 = lag(rec_rank, 2),
+    rec_rank_lag3 = lag(rec_rank, 3),
+    
+    rec_points_lag1 = lag(rec_points, 1),
+    rec_points_lag2 = lag(rec_points, 2),
+    rec_points_lag3 = lag(rec_points, 3),
+    
+    avg_rec_points_prev_3yrs = round(
+      (rec_points_lag1 + rec_points_lag2 + rec_points_lag3) / 3,
+      1
+    ),
+    
+    avg_rec_rank_prev_3yrs = round(
+      (rec_rank_lag1 + rec_rank_lag2 + rec_rank_lag3) / 3,
+      1
+    )
+  ) %>%
+  ungroup()
+```
+
+```{r}
+# 11. DATA VALIDATION TABLE
+
+
+# Validate the merged dataset for common data quality issues.
+validation_table <- tibble(
+  check_name = c(
+    "Missing team names",
+    "Impossible win percentage",
+    "Wins greater than games",
+    "Negative games",
+    "Duplicate team-year rows",
+    "Missing recruiting points after merge",
+    "Missing AP ranking features after merge"
+  ),
+  failed_rows = c(
+    sum(is.na(final_df$team) | final_df$team == ""),
+    sum(final_df$win_pct < 0 | final_df$win_pct > 1, na.rm = TRUE),
+    sum(final_df$wins > final_df$games, na.rm = TRUE),
+    sum(final_df$games < 0, na.rm = TRUE),
+    final_df %>%
+      count(team_clean, year) %>%
+      filter(n > 1) %>%
+      nrow(),
+    sum(is.na(final_df$rec_points)),
+    sum(is.na(final_df$times_ranked))
+  )
+)
+#checks missing names, impossible values, duplicates
+validation_table
+```
+
+```{r}
+# 12. EXPLORATORY SUMMARIES
+
+final_df %>%
+  summarise(
+    teams = n_distinct(team_clean),
+    seasons = n_distinct(year),
+    rows = n(),
+    avg_win_pct = round(mean(win_pct, na.rm = TRUE), 3),
+    avg_rec_points = round(mean(rec_points, na.rm = TRUE), 1)
+  )
+
+final_df %>%
+  filter(!is.na(rec_points)) %>%
+  summarise(
+    correlation_rec_points_win_pct = round(cor(rec_points, win_pct, use = "complete.obs"), 3),
+    correlation_prev_3yr_rec_points_win_pct = round(cor(avg_rec_points_prev_3yrs, win_pct, use = "complete.obs"), 3)
+  )
+```
+```{r}
+# 13. FINAL DASHBOARD DATASET
+
+# Keep only team-year rows that successfully matched recruiting data.
+
+dashboard_df <- final_df %>%
+  filter(
+    !is.na(rec_points)   # keeps teams that matched recruiting data
+  ) %>%
+  select(
+    year,
+    team,
+    team_clean,
+    games,
+    wins,
+    losses,
+    win_pct,
+    points_for_avg,
+    points_against_avg,
+    avg_pd,
+    rec_rank,
+    rec_points,
+    rec_avg,
+    five_star,
+    four_star,
+    three_star,
+    commits,
+    rec_rank_lag1,
+    rec_rank_lag2,
+    rec_rank_lag3,
+    rec_points_lag1,
+    rec_points_lag2,
+    rec_points_lag3,
+    avg_rec_points_prev_3yrs,
+    avg_rec_rank_prev_3yrs,
+    times_ranked,
+    avg_rank,
+    best_rank,
+    final_rank,
+    preseason_rank
+  )
+
+# Recruiting points are needed for the main dashboard analysis.
+```
+
+```{r}
+dashboard_validation <- tibble(
+  check_name = c(
+    "Missing team names",
+    "Impossible win percentage",
+    "Wins greater than games",
+    "Negative games",
+    "Duplicate team-year rows",
+    "Missing recruiting points",
+    "Invalid AP ranking values"
+  ),
+  failed_rows = c(
+    sum(is.na(dashboard_df$team) | dashboard_df$team == ""),
+    sum(dashboard_df$win_pct < 0 | dashboard_df$win_pct > 1, na.rm = TRUE),
+    sum(dashboard_df$wins > dashboard_df$games, na.rm = TRUE),
+    sum(dashboard_df$games < 0, na.rm = TRUE),
+    dashboard_df %>%
+      count(team_clean, year) %>%
+      filter(n > 1) %>%
+      nrow(),
+    sum(is.na(dashboard_df$rec_points)),
+    sum(dashboard_df$avg_rank < 1 | dashboard_df$avg_rank > 26, na.rm = TRUE)
+  )
+)
+
+# Run a second validation pass on the final dashboard dataset.
+# This confirms the exported file is clean
+
+dashboard_validation
+```
+
+Missing AP rankings were not treated as errors. Teams not appearing in the AP poll were assigned a default rank of 26 and zero weeks ranked.
+
+```{r}
+dashboard_df <- dashboard_df %>%
+  mutate(
+    times_ranked = replace_na(times_ranked, 0),
+    avg_rank = replace_na(avg_rank, 26),
+    best_rank = replace_na(best_rank, 26),
+    final_rank = replace_na(final_rank, 26),
+    preseason_rank = replace_na(preseason_rank, 26)
+  )
+```
+
+
+```{r}
+# 14. EXPORT FINAL FILES
+
+
+# Export the cleaned dashboard dataset and validation table for Tableau.
+# These files are the final inputs used in the visualization portion of the project.
+
+write.csv(dashboard_df, "data/final_college_football_recruiting_dashboard.csv", row.names = FALSE)
+write.csv(dashboard_validation, "data/dashboard_validation_table.csv", row.names = FALSE)
+```
+
