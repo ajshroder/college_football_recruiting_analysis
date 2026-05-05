@@ -6,6 +6,9 @@
 ### Andrew Shroder, Ben Burns, Andrew Wolfson, Cole LaCamera
 
 ---
+Tableau Link: 
+Youtube Link: youtube.com/watch?v=P0VLp4zy7TU&feature=youtu.be
+---
 
 ## Project Summary
 
