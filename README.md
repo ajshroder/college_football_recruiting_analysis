@@ -2,15 +2,15 @@
 
 ## College Football Recruiting Analysis
 
----
+--
 
 ### Team 15
 
----
+--
 
 ### Andrew Shroder, Ben Burns, Andrew Wolfson, Cole LaCamera
 
----
+--
 
 ## Project Summary
 
